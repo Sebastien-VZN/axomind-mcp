@@ -1,0 +1,1 @@
+"""Axomind MCP — harmless proxy to bot_api.php."""

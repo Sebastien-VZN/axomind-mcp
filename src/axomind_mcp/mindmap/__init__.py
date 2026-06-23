@@ -1,0 +1,1 @@
+"""Mindmap package — mindmap tools and layout configuration."""

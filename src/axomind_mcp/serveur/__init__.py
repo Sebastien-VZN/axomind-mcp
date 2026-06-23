@@ -1,0 +1,1 @@
+"""Server package — MCP server and WebSocket listener."""

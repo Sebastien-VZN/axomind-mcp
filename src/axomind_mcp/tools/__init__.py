@@ -1,0 +1,1 @@
+"""Tools package — file reader, markdown converter, and tree scanner."""

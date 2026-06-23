@@ -1,0 +1,33 @@
+[project]
+name = "axomind-mcp"
+version = "0.1.0"
+description = "MCP server for Axomind — harmless proxy to bot_api.php"
+readme = "README.md"
+license = { text = "Proprietary — Copyright © 2025 VEZZANI Sébastien. All rights reserved." }
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+axomind-mcp = "axomind_mcp.serveur.server:main"
+axomind-daemon = "axomind_mcp.daemon:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/axomind_mcp"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
