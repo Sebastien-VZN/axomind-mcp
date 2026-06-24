@@ -197,6 +197,56 @@ OLLAMA_TOOLS = [
             },
         },
     },
+    # ── Bot API: Mindmap summary tools (2) — compact views for context safety ──
+    {
+        "type": "function",
+        "function": {
+            "name": "get_mindmap_summary",
+            "description": (
+                "Read a compact summary of a mindmap — node count, titles, structure, "
+                "and whether each node has a description. Does NOT return full node data, "
+                "descriptions, positions, or styles. Use this when you need to know how "
+                "many nodes exist or what the structure looks like, without loading the "
+                "full (potentially huge) mindmap data."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_mindmap": {
+                        "type": "integer",
+                        "description": "ID of the mindmap to summarize.",
+                    },
+                },
+                "required": ["id_mindmap"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_node_description",
+            "description": (
+                "Read the description of a single node in a mindmap by its order_index. "
+                "Returns the description text (Quill Delta JSON) for that specific node. "
+                "Use this after get_mindmap_summary to read the content of a specific node "
+                "without loading the entire mindmap. The description is capped at ~4 KB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_mindmap": {
+                        "type": "integer",
+                        "description": "ID of the mindmap.",
+                    },
+                    "order_index": {
+                        "type": "integer",
+                        "description": "Order index of the node to read (1-based).",
+                    },
+                },
+                "required": ["id_mindmap", "order_index"],
+            },
+        },
+    },
     # ── Bot API: Messenger tools (4) ──
     {
         "type": "function",
@@ -279,7 +329,7 @@ OLLAMA_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_activities",
-            "description": "List activities assigned to the bot (metadata only).",
+            "description": "List all activities assigned to the bot. Returns activity IDs, titles, and participant user IDs. Use this first to find activity IDs before calling get_activity or verify_assignment.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -287,13 +337,13 @@ OLLAMA_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_activity",
-            "description": "Read a specific activity (full metadata).",
+            "description": "Read a specific activity's full metadata, including assignment groups (recursive groups with title, date range, active weekdays) and all time slots (slot_id, day_of_year, user_id, start_time, end_time). Use this to inspect what slots are assigned to which users.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "id_activity": {
                         "type": "integer",
-                        "description": "ID of the activity.",
+                        "description": "ID of the activity (from list_activities).",
                     },
                 },
                 "required": ["id_activity"],
@@ -358,7 +408,7 @@ OLLAMA_TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_assignment",
-            "description": "Delete an assignment group.",
+            "description": "Delete an assignment group and all its time slots.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -372,6 +422,167 @@ OLLAMA_TOOLS = [
                     },
                 },
                 "required": ["id_activity", "delete_recursive_group_slot"],
+            },
+        },
+    },
+    # ── Bot API: Planning helpers (3) — human-friendly wrappers ──
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_assignment",
+            "description": "Verify and inspect all assignments for an activity. Returns a readable telemetry report with: activity info (id, title, participants), per-group details (group_id, title, type, date range, active weekdays), per-slot details (slot_id, day_of_year, user_id, start/end times), and consistency checks. Use this to read the planning of an activity in a human-readable format.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_activity": {
+                        "type": "integer",
+                        "description": "ID of the activity to verify (from list_activities).",
+                    },
+                },
+                "required": ["id_activity"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_planning",
+            "description": "Read ALL time slots for a given year. This is the ONLY tool that returns actual slot data (start_time, end_time, dates, user assignments). get_activity and verify_assignment do NOT return slot data — use read_planning instead. Returns a report organized by activity, with per-group details (title, date range, active weekdays) and per-slot details (date, day_of_year, user_id, start/end times). Pass id_activity=0 to get all activities, or a specific activity ID to filter.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "integer",
+                        "description": "Year to read (e.g. 2026). Returns all slots for that year.",
+                    },
+                    "id_activity": {
+                        "type": "integer",
+                        "description": "Optional: filter to a specific activity. 0 = all activities (default).",
+                    },
+                },
+                "required": ["year"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_assignment",
+            "description": "Create a planning assignment with human-friendly parameters. Builds the JSON payloads internally — just provide dates (YYYY-MM-DD), times (hour/minute integers), and weekday names. Single-day: start_date == end_date, weekdays omitted. Recursive: start_date < end_date, weekdays specifies active days (monday, tuesday, etc.).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_activity": {
+                        "type": "integer",
+                        "description": "ID of the activity (from list_activities).",
+                    },
+                    "user_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of user IDs to assign (from activity participants).",
+                    },
+                    "titre": {
+                        "type": "string",
+                        "description": "Assignment title (e.g. \"Morning shift\").",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date in YYYY-MM-DD format (e.g. \"2026-06-23\").",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date in YYYY-MM-DD format. For single-day, use same as start_date.",
+                    },
+                    "start_hour": {
+                        "type": "integer",
+                        "description": "Start hour 0-23 (e.g. 8 for 08:00).",
+                    },
+                    "start_minute": {
+                        "type": "integer",
+                        "description": "Start minute 0-59 (e.g. 0).",
+                    },
+                    "end_hour": {
+                        "type": "integer",
+                        "description": "End hour 0-23 (e.g. 14 for 14:00).",
+                    },
+                    "end_minute": {
+                        "type": "integer",
+                        "description": "End minute 0-59 (e.g. 0).",
+                    },
+                    "weekdays": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Active weekday names for recursive mode. Case-insensitive: monday/mon, tuesday/tue, etc. Omit for single-day.",
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Optional notes text.",
+                    },
+                },
+                "required": ["id_activity", "user_ids", "titre", "start_date", "end_date", "start_hour", "start_minute", "end_hour", "end_minute"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "modify_assignment",
+            "description": "Modify an existing assignment group with human-friendly parameters. Replaces the group definition and all its time slots. Uses the same parameters as create_assignment but requires group_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_activity": {
+                        "type": "integer",
+                        "description": "ID of the activity.",
+                    },
+                    "group_id": {
+                        "type": "integer",
+                        "description": "Existing group ID to update (from get_activity or verify_assignment).",
+                    },
+                    "user_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of user IDs to assign.",
+                    },
+                    "titre": {
+                        "type": "string",
+                        "description": "Assignment title.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date in YYYY-MM-DD format.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date in YYYY-MM-DD format (same as start_date for single-day).",
+                    },
+                    "start_hour": {
+                        "type": "integer",
+                        "description": "Start hour 0-23.",
+                    },
+                    "start_minute": {
+                        "type": "integer",
+                        "description": "Start minute 0-59.",
+                    },
+                    "end_hour": {
+                        "type": "integer",
+                        "description": "End hour 0-23.",
+                    },
+                    "end_minute": {
+                        "type": "integer",
+                        "description": "End minute 0-59.",
+                    },
+                    "weekdays": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Active weekday names for recursive mode. Omit for single-day.",
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Optional notes text.",
+                    },
+                },
+                "required": ["id_activity", "group_id", "user_ids", "titre", "start_date", "end_date", "start_hour", "start_minute", "end_hour", "end_minute"],
             },
         },
     },

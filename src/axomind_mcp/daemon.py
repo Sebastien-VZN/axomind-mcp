@@ -68,6 +68,12 @@ from axomind_mcp.mindmap._mindmap import (
     replace_mindmap as _mindmap_replace_mindmap,
     update_nodes_style as _mindmap_update_nodes_style,
 )
+from axomind_mcp._planning import (
+    create_assignment as _planning_create_assignment,
+    modify_assignment as _planning_modify_assignment,
+    verify_assignment as _planning_verify_assignment,
+    read_planning as _planning_read_planning,
+)
 from axomind_mcp.serveur._ws_listener import (
     WSEvent,
     register_callback,
@@ -83,7 +89,7 @@ logger = logging.getLogger("axomind_mcp.daemon")
 
 OLLAMA_URL = os.environ.get("AXOMIND_OLLAMA_URL", "")
 OLLAMA_MODEL = os.environ.get("AXOMIND_OLLAMA_MODEL", "")
-OLLAMA_TIMEOUT = int(os.environ.get("AXOMIND_OLLAMA_TIMEOUT", "60"))
+OLLAMA_TIMEOUT = int(os.environ.get("AXOMIND_OLLAMA_TIMEOUT", "120"))
 # Token renewal interval (23h — token expires at 24h)
 TOKEN_RENEW_INTERVAL = 23 * 3600  # seconds
 
@@ -93,6 +99,95 @@ TOKEN_RENEW_INTERVAL = 23 * 3600  # seconds
 # ──────────────────────────────────────────────
 
 # DEFAULT_SYSTEM_PROMPT is imported from axomind_mcp._doctrines
+
+
+# ──────────────────────────────────────────────
+# Tool result size guard
+# ──────────────────────────────────────────────
+
+_MAX_TOOL_RESULT_CHARS = 30_000  # ~30 KB — Ollama context safety
+
+
+def _truncate_tool_result(result: str, max_chars: int = _MAX_TOOL_RESULT_CHARS) -> str:
+    """Truncate a tool result if it exceeds max_chars.
+
+    Appends a note explaining the truncation and suggesting targeted tools.
+    """
+    if len(result) <= max_chars:
+        return result
+    truncated = result[:max_chars]
+    note = (
+        f"\n\n[RESULT TRUNCATED — {len(result)} chars total, showing {max_chars}. "
+        "Use get_mindmap_summary or get_node_description for targeted reads.]"
+    )
+    return truncated + note
+
+
+def _build_mindmap_summary(raw: str, id_mindmap: int) -> str:
+    """Build a compact summary of a mindmap from the raw API response.
+
+    Returns: total_nodes, max_depth, estimated_size_kb, and a list of nodes
+    with {order_index, title, parent, size_box, has_description}.
+    No descriptions, no positions, no styles — context-safe.
+    """
+    try:
+        data = json.loads(raw)
+        nodes = data.get("nodes", [])
+        if not isinstance(nodes, list):
+            return raw
+
+        compact_nodes = []
+        max_depth = 0
+        total_desc_bytes = 0
+        # Build a set of parent order_indexes for depth calculation
+        oi_set = {n.get("order_index", 0) for n in nodes}
+        for n in nodes:
+            oi = n.get("order_index", 0)
+            parent = n.get("parent", 0)
+            desc = n.get("descriptions", "")
+            has_desc = bool(desc) and desc != "[]" and desc != ""
+            if has_desc:
+                total_desc_bytes += len(desc)
+            # Compute depth by walking up the parent chain
+            depth = 0
+            current_parent = parent
+            visited = set()
+            while current_parent in oi_set and current_parent not in visited:
+                visited.add(current_parent)
+                depth += 1
+                # Find the parent's parent
+                parent_node = next(
+                    (pn for pn in nodes if pn.get("order_index") == current_parent),
+                    None,
+                )
+                if parent_node is None:
+                    break
+                current_parent = parent_node.get("parent", 0)
+            if depth > max_depth:
+                max_depth = depth
+
+            compact_nodes.append({
+                "order_index": oi,
+                "title": n.get("title", ""),
+                "parent": parent,
+                "size_box": n.get("size_box", 0),
+                "has_description": has_desc,
+            })
+
+        summary = {
+            "id_mindmap": id_mindmap,
+            "total_nodes": len(nodes),
+            "max_depth": max_depth,
+            "estimated_size_kb": round(len(raw) / 1024, 1),
+            "nodes": compact_nodes,
+            "note": (
+                "Compact summary — no descriptions or styles. "
+                "Use get_node_description(id_mindmap, order_index) to read a node's content."
+            ),
+        }
+        return json.dumps(summary, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return raw
 
 
 # ──────────────────────────────────────────────
@@ -153,7 +248,41 @@ def _execute_tool(name: str, arguments: dict) -> str:
         return _post("mindmap", "get_mindmaps")
 
     elif name == "get_mindmap":
-        return _post("mindmap", "get_mindmap", id_mindmap=arguments.get("id_mindmap", 0))
+        # Return a compact summary instead of the full JSON.
+        # Full mindmap data can be 900KB+ (Quill Delta descriptions) which
+        # exceeds Ollama's context limit and causes 400 Bad Request.
+        raw = _post("mindmap", "get_mindmap", id_mindmap=arguments.get("id_mindmap", 0))
+        return _build_mindmap_summary(raw, arguments.get("id_mindmap", 0))
+
+    elif name == "get_mindmap_summary":
+        raw = _post("mindmap", "get_mindmap", id_mindmap=arguments.get("id_mindmap", 0))
+        return _build_mindmap_summary(raw, arguments.get("id_mindmap", 0))
+
+    elif name == "get_node_description":
+        id_mm = arguments.get("id_mindmap", 0)
+        oi = arguments.get("order_index", 0)
+        raw = _post("mindmap", "get_mindmap", id_mindmap=id_mm)
+        try:
+            data = json.loads(raw)
+            nodes = data.get("nodes", [])
+            if isinstance(nodes, list):
+                for n in nodes:
+                    if n.get("order_index") == oi:
+                        desc = n.get("descriptions", "")
+                        if len(desc) > 4000:
+                            desc = desc[:4000] + "\n[Description truncated — exceeds 4 KB]"
+                        return json.dumps({
+                            "id_mindmap": id_mm,
+                            "order_index": oi,
+                            "title": n.get("title", ""),
+                            "description": desc,
+                        }, ensure_ascii=False)
+                return json.dumps({
+                    "error": f"Node with order_index={oi} not found in mindmap {id_mm}",
+                })
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return raw
 
     elif name == "sync_nodes":
         return _post(
@@ -248,6 +377,48 @@ def _execute_tool(name: str, arguments: dict) -> str:
             delete_recursive_group_slot=arguments.get("delete_recursive_group_slot", 0),
         )
 
+    # ── Bot API: Planning helpers (3) — human-friendly wrappers ──
+
+    elif name == "verify_assignment":
+        return _planning_verify_assignment(id_activity=arguments.get("id_activity", 0))
+
+    elif name == "read_planning":
+        return _planning_read_planning(
+            year=arguments.get("year", 2026),
+            id_activity=arguments.get("id_activity", 0),
+        )
+
+    elif name == "create_assignment":
+        return _planning_create_assignment(
+            id_activity=arguments.get("id_activity", 0),
+            user_ids=arguments.get("user_ids", []),
+            titre=arguments.get("titre", ""),
+            start_date=arguments.get("start_date", ""),
+            end_date=arguments.get("end_date", ""),
+            start_hour=arguments.get("start_hour", 0),
+            start_minute=arguments.get("start_minute", 0),
+            end_hour=arguments.get("end_hour", 0),
+            end_minute=arguments.get("end_minute", 0),
+            weekdays=arguments.get("weekdays", None),
+            notes=arguments.get("notes", ""),
+        )
+
+    elif name == "modify_assignment":
+        return _planning_modify_assignment(
+            id_activity=arguments.get("id_activity", 0),
+            group_id=arguments.get("group_id", 0),
+            user_ids=arguments.get("user_ids", []),
+            titre=arguments.get("titre", ""),
+            start_date=arguments.get("start_date", ""),
+            end_date=arguments.get("end_date", ""),
+            start_hour=arguments.get("start_hour", 0),
+            start_minute=arguments.get("start_minute", 0),
+            end_hour=arguments.get("end_hour", 0),
+            end_minute=arguments.get("end_minute", 0),
+            weekdays=arguments.get("weekdays", None),
+            notes=arguments.get("notes", ""),
+        )
+
     else:
         return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -318,7 +489,7 @@ def _process_message_with_ollama(
     ]
 
     # Tool-calling loop (max 5 iterations to prevent infinite loops)
-    max_iterations = 5
+    max_iterations = 8
     for i in range(max_iterations):
         response = _call_ollama(messages, tools=OLLAMA_TOOLS)
 
@@ -345,7 +516,7 @@ def _process_message_with_ollama(
                     tool_args = {}
 
                 logger.info(f"Tool call: {tool_name}({tool_args})")
-                result = _execute_tool(tool_name, tool_args)
+                result = _truncate_tool_result(_execute_tool(tool_name, tool_args))
                 logger.debug(f"Tool result: {result[:200]}...")
 
                 # Add tool result to conversation
@@ -638,6 +809,66 @@ def _validate_env() -> bool:
     return True
 
 
+def _check_ollama() -> bool:
+    """Test the Ollama service by sending a minimal chat request.
+
+    Sends a tiny "ping" message to verify that the Ollama endpoint is
+    reachable and the model is loaded. Only called in Ollama mode
+    (USE_HERMES=False).
+
+    Returns True if Ollama responded, False otherwise. Logs clear messages.
+    """
+    logger.info(f"Testing Ollama service at {OLLAMA_URL} (model={OLLAMA_MODEL})...")
+    try:
+        resp = httpx.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": False,
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = (
+            data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if "choices" in data
+            else data.get("message", {}).get("content", "")
+        )
+        if not content and "error" in data:
+            logger.error(f"Ollama returned an error: {data['error']}")
+            return False
+        logger.info(
+            f"Ollama service OK — model responded "
+            f"(reply length={len(content)} chars)"
+        )
+        return True
+    except httpx.ConnectError:
+        logger.error(
+            f"Cannot connect to Ollama at {OLLAMA_URL}\n"
+            "  Check that Ollama is running and the URL is correct.\n"
+            "  Verify with: curl -s <ollama_host>:11434/api/tags | jq '.models[].name'\n"
+            "  If the model is not listed, pull it: ollama pull <model_tag>"
+        )
+        return False
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"Ollama returned HTTP {e.response.status_code}\n"
+            "  This usually means the model tag is wrong or not pulled.\n"
+            f"  Check available models: curl -s {OLLAMA_URL.rsplit('/', 3)[0]}://"
+            f"{OLLAMA_URL.split('//')[1].rsplit('/', 3)[0]}/api/tags\n"
+            "  Pull the model if needed: ollama pull <model_tag>"
+        )
+        return False
+    except httpx.HTTPError as e:
+        logger.error(
+            f"Ollama service check failed: {e}\n"
+            "  The Ollama endpoint may be down or the model may not be loaded."
+        )
+        return False
+
+
 # Login return codes for human-readable error messages
 _LOGIN_CODES = {
     0: "Success",
@@ -677,8 +908,20 @@ def main() -> None:
 
     logger.info(
         f"Variables validated — mode={'hermes' if USE_HERMES else 'ollama'}, "
-        f"model={OLLAMA_MODEL if not USE_HERMES else 'N/A'}"
+        f"model={OLLAMA_MODEL if not USE_HERMES else 'N/A'}, "
+        f"ollama={OLLAMA_URL if not USE_HERMES else 'N/A'}"
     )
+
+    # 2b. Test Ollama service (Ollama mode only)
+    if not USE_HERMES:
+        if not _check_ollama():
+            logger.error(
+                "Ollama service is not available. The daemon cannot process "
+                "messages without a working AI backend.\n"
+                "  Fix: ensure Ollama is running and the model is pulled.\n"
+                "  Or switch to Hermes mode by setting AXOMIND_USE_HERMES=true."
+            )
+            sys.exit(1)
 
     # 3. Test user login
     logger.info("Testing user login...")

@@ -13,7 +13,7 @@ in the Flutter mixin_forms_planning.dart (setSingleOutForm / setMultiOutForm).
 import datetime
 import json
 
-from axomind_mcp._common import _post, mcp
+from axomind_mcp._common import _post, _post_user, mcp
 
 # ──────────────────────────────────────────────
 # Helpers — date/time conversion (mirrors LibDatetime Dart)
@@ -703,3 +703,193 @@ def verify_assignment(id_activity: int) -> str:
         "raw_activity": activity,
     }
     return json.dumps(report, indent=2)
+
+
+@mcp.tool()
+def read_planning(year: int, id_activity: int = 0) -> str:
+    """Read all planning slots for a given year via the user API.
+
+    This is the ONLY tool that returns actual time slot data (start_time, end_time,
+    day of year, user assignments). The bot API get_activity does NOT include slots —
+    they are stored in planning_days_content + planning_time_slot, accessed via the
+    user API (read_plannings + read_planning_group_control routes).
+
+    Args:
+        year: Year to read (e.g. 2026). Returns all slots for that year.
+        id_activity: Optional — filter to a specific activity. 0 = all activities.
+
+    Returns:
+        JSON string — a readable report with:
+        - Per-activity summary: activity_id, group_title, date_range, active_weekdays,
+          slots: [{day_of_year, user_id, start_time, end_time}]
+        - If id_activity is 0, all activities are included.
+        - If id_activity is set, only that activity's slots are returned.
+
+    Workflow:
+        1. Call list_activities to get activity IDs
+        2. Call read_planning(year=2026) to get all slots
+        3. Filter by activity or user as needed
+    """
+    # 1. Read planning days (slots) via user API
+    raw_slots = _post_user(
+        "read_plannings",
+        get_planning="1",
+        year=str(year),
+    )
+
+    # 2. Read group controls (recursive groups) via user API
+    raw_groups = _post_user(
+        "read_planning_group_control",
+        get_groupe_control="1",
+        year=str(year),
+    )
+
+    try:
+        slots_data = json.loads(raw_slots)
+    except (json.JSONDecodeError, TypeError):
+        slots_data = []
+    try:
+        groups_data = json.loads(raw_groups)
+    except (json.JSONDecodeError, TypeError):
+        groups_data = []
+
+    # Ensure we have lists — the API may return a dict with return_code on error
+    if not isinstance(slots_data, list):
+        slots_data = []
+    if not isinstance(groups_data, list):
+        groups_data = []
+
+    # Build a lookup of group controls by id
+    groups_by_id: dict[int, dict] = {}
+    for g in groups_data:
+        if not isinstance(g, dict):
+            continue
+        try:
+            gid = int(g.get("id", 0))
+            groups_by_id[gid] = g
+        except (TypeError, ValueError):
+            pass
+
+    # Build a lookup of activity titles from list_activities
+    raw_activities = _post("activity", "get_activities")
+    activity_titles: dict[int, str] = {}
+    try:
+        act_data = json.loads(raw_activities)
+        activities_list = act_data.get("activities", []) if isinstance(act_data, dict) else []
+        for a in activities_list:
+            try:
+                aid = int(a.get("id", 0))
+                activity_titles[aid] = a.get("titre", f"activity_{aid}")
+            except (TypeError, ValueError):
+                pass
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Organize slots by activity
+    # Each planning_days_content entry has: id, slot_year, index_position_jour,
+    # rel_id_user, taches: [{id, rel_id_planning_day, rel_id_activity,
+    #   group_control_id, start_time, end_time, maj_datetime}]
+    by_activity: dict[int, list[dict]] = {}
+
+    if isinstance(slots_data, list):
+        for day in slots_data:
+            if not isinstance(day, dict):
+                continue
+            day_of_year = day.get("index_position_jour", 0)
+            user_id = day.get("rel_id_user", 0)
+            taches = day.get("taches", [])
+            if not isinstance(taches, list):
+                continue
+            for slot in taches:
+                if not isinstance(slot, dict):
+                    continue
+                act_id = 0
+                try:
+                    act_id = int(slot.get("rel_id_activity", 0))
+                except (TypeError, ValueError):
+                    pass
+
+                # Filter by activity if specified
+                if id_activity and act_id != id_activity:
+                    continue
+
+                group_id = 0
+                try:
+                    group_id = int(slot.get("group_control_id", 0))
+                except (TypeError, ValueError):
+                    pass
+
+                slot_info = {
+                    "slot_id": slot.get("id", 0),
+                    "day_of_year": day_of_year,
+                    "user_id": user_id,
+                    "start_time": slot.get("start_time", ""),
+                    "end_time": slot.get("end_time", ""),
+                    "group_id": group_id,
+                    "activity_id": act_id,
+                }
+
+                if act_id not in by_activity:
+                    by_activity[act_id] = []
+                by_activity[act_id].append(slot_info)
+
+    # Build the final report
+    activities_report = []
+    for act_id, slots in sorted(by_activity.items()):
+        # Group slots by group_control_id
+        by_group: dict[int, list[dict]] = {}
+        for s in slots:
+            gid = s.get("group_id", 0)
+            if gid not in by_group:
+                by_group[gid] = []
+            by_group[gid].append(s)
+
+        groups_report = []
+        for gid, group_slots in sorted(by_group.items()):
+            group_info = groups_by_id.get(gid, {})
+            # Decode active_days bitmask to weekday names
+            active_days = group_info.get("active_days", 0)
+            try:
+                active_days = int(active_days)
+            except (TypeError, ValueError):
+                active_days = 0
+            weekday_names = []
+            weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            for bit in range(7):
+                if active_days & (1 << bit):
+                    weekday_names.append(weekday_labels[bit])
+
+            # Convert day_of_year to dates
+            for s in group_slots:
+                doy = s.get("day_of_year", 0)
+                try:
+                    date = datetime.datetime(year, 1, 1) + datetime.timedelta(days=int(doy) - 1)
+                    s["date"] = date.strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    s["date"] = f"day_{doy}"
+
+            groups_report.append({
+                "group_id": gid,
+                "titre": group_info.get("titre", f"group_{gid}"),
+                "start_date": group_info.get("start_date", ""),
+                "end_date": group_info.get("end_date", ""),
+                "active_weekdays": weekday_names,
+                "slot_count": len(group_slots),
+                "slots": group_slots,
+            })
+
+        activities_report.append({
+            "activity_id": act_id,
+            "activity_title": activity_titles.get(act_id, f"activity_{act_id}"),
+            "total_slots": len(slots),
+            "groups": groups_report,
+        })
+
+    report = {
+        "year": year,
+        "activity_filter": id_activity if id_activity else "all",
+        "activities": activities_report,
+        "total_activities": len(activities_report),
+        "total_slots": sum(a["total_slots"] for a in activities_report),
+    }
+    return json.dumps(report, indent=2, default=str)
